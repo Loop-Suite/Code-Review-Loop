@@ -303,13 +303,16 @@ fn prioritize_and_cap_diff(diff: &str) -> (String, Vec<String>) {
     (out, dropped)
 }
 
+/// Returns the normalized `Input` plus the list of files `prioritize_and_cap_diff` had to drop
+/// from what's actually sent to the LLM (empty if nothing was dropped) — #129 surfaces this in
+/// `manifest.json` as structured data instead of only the in-diff text note.
 pub fn normalize(
     diff_path: &Path,
     requirements_path: &Option<std::path::PathBuf>,
     conventions_path: &Option<std::path::PathBuf>,
     deterministic_results_path: &Option<std::path::PathBuf>,
     language: Option<String>,
-) -> Result<Input> {
+) -> Result<(Input, Vec<String>)> {
     let diff = std::fs::read_to_string(diff_path)
         .with_context(|| format!("failed to read diff file: {}", diff_path.display()))?;
     anyhow::ensure!(!diff.trim().is_empty(), "diff is empty");
@@ -348,16 +351,19 @@ pub fn normalize(
         }
     };
 
-    Ok(Input {
-        diff,
-        changed_files,
-        added_lines,
-        removed_lines,
-        requirements,
-        conventions,
-        deterministic_results,
-        config: RunConfig { language },
-    })
+    Ok((
+        Input {
+            diff,
+            changed_files,
+            added_lines,
+            removed_lines,
+            requirements,
+            conventions,
+            deterministic_results,
+            config: RunConfig { language },
+        },
+        dropped_files,
+    ))
 }
 
 #[cfg(test)]

@@ -130,6 +130,11 @@ Output (normally under `runs/pr123`):
 - `report.md`: verdict, policy checks, quantitative summary, requirements/conventions,
   findings, good things, deterministic checks, and discourse audit
 - `state.json`: review state snapshot used by `--prior`
+- `manifest.json`: per-run metadata for after-the-fact debugging — codereview version,
+  model/cheap-model, spec name/path/hash, round, selected lenses, successful-lens count, stage
+  errors/warnings, files dropped from the diff due to the size cap, and the LLM usage summary.
+  Best-effort — a failure to write it doesn't fail the run, since report.md/state.json have
+  already landed by that point.
 
 ### `--prior` (re-review after patching)
 
