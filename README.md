@@ -19,6 +19,9 @@ git diff > diff.patch
 ./target/release/codereview review --spec specs/default.toml --diff diff.patch --out runs/
 ```
 
+Or grab a prebuilt binary (macOS/Linux) from [Releases](../../releases) once a tagged
+release exists — see [CHANGELOG.md](CHANGELOG.md) for what's changed between releases.
+
 Two things worth knowing before your first real run:
 
 - ⚠ the diff (and any `--requirements`/`--conventions` content) is sent verbatim to the
