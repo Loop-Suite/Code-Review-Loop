@@ -345,7 +345,11 @@ sequenceDiagram
   they're the first to go if the diff needs trimming. Past a 1,000,000-character hard cap, the
   lowest-priority blocks are dropped from the tail — visibly, with a warning and an in-diff note
   listing what got dropped, never silently. `report.md`'s file/line-count stats still reflect the
-  full original diff regardless of what got trimmed from what's actually sent to the LLM.
+  full original diff regardless of what got trimmed from what's actually sent to the LLM. This
+  cap is character-based, not token-based — a rough ~4-chars-per-token estimate is included in
+  the large-diff warning for context, but it isn't a real per-provider/model tokenizer, so it can
+  trigger too early or too late relative to the actual context window depending on the diff's
+  language/content.
 - `claude -p` runtime depends on repository size and prompt density; expect seconds to
   minutes per run.
 

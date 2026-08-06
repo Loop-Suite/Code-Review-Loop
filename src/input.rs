@@ -182,6 +182,17 @@ fn is_noisy_path(path: &str) -> bool {
 /// diff can't grow unbounded and risk exceeding the model's context window.
 const DIFF_HARD_CAP_CHARS: usize = 1_000_000;
 
+/// #127: DIFF_HARD_CAP_CHARS/DIFF_WARN_CHARS protect against context-window overflow, but
+/// they're measured in characters while the thing they're actually protecting against is
+/// tokens — a wildly different ratio depending on the language/content (dense code vs.
+/// natural-language-heavy diffs vs. non-Latin scripts). This isn't a per-provider/model tokenizer
+/// (that's the bigger ask in #127, not done here) — just the commonly-cited ~4-chars-per-token
+/// rule of thumb for English/code, good enough to put an approximate number next to the char
+/// count in warnings so it reads as "roughly how much context this uses," not an exact figure.
+pub(crate) fn estimate_tokens(s: &str) -> usize {
+    s.chars().count().div_ceil(4)
+}
+
 /// Backs off from `max_bytes` to the nearest earlier UTF-8 char boundary, so truncating a
 /// `&str` there never panics or produces invalid UTF-8.
 fn truncate_at_char_boundary(s: &str, max_bytes: usize) -> &str {
@@ -352,6 +363,24 @@ pub fn normalize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- estimate_tokens() ---
+
+    #[test]
+    fn estimate_tokens_rounds_up_to_the_nearest_whole_token() {
+        assert_eq!(estimate_tokens(""), 0);
+        assert_eq!(estimate_tokens("abc"), 1); // 3 chars -> ceil(3/4) = 1
+        assert_eq!(estimate_tokens("abcd"), 1); // exactly 4 chars -> 1
+        assert_eq!(estimate_tokens("abcde"), 2); // 5 chars -> ceil(5/4) = 2
+    }
+
+    #[test]
+    fn estimate_tokens_counts_unicode_scalars_not_bytes() {
+        // A multi-byte-per-char string must not inflate the estimate just because it's more
+        // bytes — chars().count() is the deliberate choice here, not s.len().
+        let s = "가나다라"; // 4 Korean chars, 12 bytes in UTF-8
+        assert_eq!(estimate_tokens(s), 1);
+    }
 
     #[test]
     fn parse_diff_stats_preserves_real_path_starting_with_b_slash() {

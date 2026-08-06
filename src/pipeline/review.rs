@@ -77,8 +77,9 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
     const DIFF_WARN_CHARS: usize = 300_000;
     if inp.diff.len() > DIFF_WARN_CHARS {
         eprintln!(
-            "Warning: diff is {} characters, which is large — the full diff is resent on every lens review/discourse/requirements call, driving up token cost",
-            inp.diff.len()
+            "Warning: diff is {} characters (~{} tokens estimated), which is large — the full diff is resent on every lens review/discourse/requirements call, driving up token cost",
+            inp.diff.len(),
+            input::estimate_tokens(&inp.diff)
         );
     }
     if inp.deterministic_results.is_none() {
