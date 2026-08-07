@@ -9,7 +9,12 @@ computes the final score, effort estimate, and pass/fail verdict.
 
 Default LLM backend is Claude Code CLI (`claude -p --output-format json`); an
 OpenRouter backend (`--backend openrouter` + `OPENROUTER_API_KEY`) is also available
-and does not require the `claude` CLI.
+and does not require the `claude` CLI. A third backend, `--backend custom` (#156),
+targets any other OpenAI-compatible chat completions endpoint — a self-hosted
+vLLM/Ollama instance, or an internal gateway — via `--base-url` and `--model` (both
+required; there's no universal default model for an arbitrary endpoint). An optional
+`CODEREVIEW_API_KEY` env var is sent as a bearer token if set; many self-hosted
+endpoints don't require one, so it's fine to leave unset.
 
 ## Quick start
 
