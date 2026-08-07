@@ -174,10 +174,17 @@ pub fn select_lenses(llm: &Llm, spec: &Spec, input: &Input) -> Result<Vec<String
                 .collect()
         })
         .unwrap_or_default();
+    // #153: the manual --lenses path explicitly rejects an always-lens id (pipeline/review.rs)
+    // — this validation used to check `spec.lens_by_id(id).is_some()`, which matches the FULL
+    // lens list, not just the `optional` catalog actually shown to the LLM above. An
+    // always-lens id returned here (hallucinated, or copied from elsewhere in context) slipped
+    // through and got run a second time through the generic defect-finding schema.
+    let optional_ids: std::collections::HashSet<&str> =
+        optional.iter().map(|l| l.id.as_str()).collect();
     let mut seen = std::collections::HashSet::new();
     let valid: Vec<String> = selected
         .into_iter()
-        .filter(|id| spec.lens_by_id(id).is_some())
+        .filter(|id| optional_ids.contains(id.as_str()))
         .filter(|id| seen.insert(id.clone()))
         .take(MAX_AUTO_SELECTED_LENSES)
         .collect();
@@ -312,6 +319,13 @@ mod tests {
         }
     }
 
+    fn always_lens(id: &str) -> crate::spec::Lens {
+        crate::spec::Lens {
+            always: true,
+            ..optional_lens(id)
+        }
+    }
+
     fn test_spec(lens_ids: &[&str]) -> crate::spec::Spec {
         crate::spec::Spec {
             name: "test".to_string(),
@@ -356,6 +370,27 @@ mod tests {
         let unique: std::collections::HashSet<_> = selected.iter().collect();
         assert_eq!(unique.len(), selected.len(), "no duplicates expected");
         assert_eq!(selected, vec!["design", "complexity", "tests"]);
+    }
+
+    #[test]
+    fn select_lenses_rejects_an_always_lens_id_even_if_the_llm_returns_it() {
+        // #153: the manual --lenses path already rejects an always-lens id explicitly
+        // (pipeline/review.rs) — auto-selection must reject it too, not just check that the id
+        // exists somewhere in the full spec.lenses list.
+        let mut spec = test_spec(&["design", "complexity"]);
+        spec.lenses.push(always_lens("good_things"));
+        let inp = test_input();
+        let response = r#"{"selected":["design","good_things"]}"#.to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+
+        let selected = select_lenses(&llm, &spec, &inp).unwrap();
+
+        assert_eq!(selected, vec!["design"]);
+        assert!(
+            !selected.contains(&"good_things".to_string()),
+            "an always-lens id must never come back from auto-selection"
+        );
     }
 
     #[test]
