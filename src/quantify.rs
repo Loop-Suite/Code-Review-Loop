@@ -112,6 +112,17 @@ fn verdict(
     if policies.iter().any(|p| p.status == PolicyStatus::Fail) {
         return "REQUEST_CHANGES".to_string();
     }
+    // #136: verdict/score used to look at CONFIRMED findings only — a P0/P1 that discourse
+    // couldn't reach consensus on (UNCERTAIN) had zero influence here, so a diff with a
+    // genuinely unresolved high-severity finding could still land on APPROVE as long as nothing
+    // else failed. MERGED is deliberately excluded — that status means "folded into another
+    // finding," not "unresolved," and the merge target's own status is checked independently.
+    if findings.iter().any(|f| {
+        matches!(f.severity.as_str(), "P0" | "P1")
+            && resolved.get(&f.id).map(|r| r.status.as_str()) == Some("UNCERTAIN")
+    }) {
+        return "NEEDS_CONTEXT".to_string();
+    }
     if confirmed.iter().any(|f| f.severity == "P1") {
         return "COMMENT".to_string();
     }
@@ -319,6 +330,53 @@ mod tests {
             verdict(&[], &HashMap::new(), &policies, &None),
             "REQUEST_CHANGES"
         );
+    }
+
+    #[test]
+    fn verdict_needs_context_on_an_uncertain_p0_even_with_nothing_else_confirmed() {
+        // #136: an UNCERTAIN P0 (discourse couldn't reach consensus) used to have zero
+        // influence on the verdict — nothing else failing meant APPROVE despite the unresolved
+        // high-severity finding.
+        let findings = vec![finding("a", "P0")];
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), resolution("a", "UNCERTAIN"));
+        assert_eq!(verdict(&findings, &resolved, &[], &None), "NEEDS_CONTEXT");
+    }
+
+    #[test]
+    fn verdict_needs_context_on_an_uncertain_p1() {
+        let findings = vec![finding("a", "P1")];
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), resolution("a", "UNCERTAIN"));
+        assert_eq!(verdict(&findings, &resolved, &[], &None), "NEEDS_CONTEXT");
+    }
+
+    #[test]
+    fn verdict_ignores_an_uncertain_p2_since_it_is_not_high_severity() {
+        let findings = vec![finding("a", "P2")];
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), resolution("a", "UNCERTAIN"));
+        assert_eq!(verdict(&findings, &resolved, &[], &None), "APPROVE");
+    }
+
+    #[test]
+    fn verdict_ignores_a_merged_p0_since_merged_means_folded_not_unresolved() {
+        // MERGED is deliberately excluded from the #136 check — it means "folded into another
+        // finding," and that survivor's own status is what should matter, not this entry.
+        let findings = vec![finding("a", "P0")];
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), resolution("a", "MERGED"));
+        assert_eq!(verdict(&findings, &resolved, &[], &None), "APPROVE");
+    }
+
+    #[test]
+    fn verdict_request_changes_still_wins_over_an_unrelated_uncertain_p1() {
+        // A confirmed P0 elsewhere must still take priority over the new NEEDS_CONTEXT check.
+        let findings = vec![finding("a", "P0"), finding("b", "P1")];
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), resolution("a", "CONFIRMED"));
+        resolved.insert("b".to_string(), resolution("b", "UNCERTAIN"));
+        assert_eq!(verdict(&findings, &resolved, &[], &None), "REQUEST_CHANGES");
     }
 
     #[test]

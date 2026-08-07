@@ -411,9 +411,14 @@ replacement for their judgment:
   blocks merge on its own.
 - Findings that assert something is *absent* from the diff (`"not in the diff"`,
   `"not present"`, `"missing"`) are the most failure-prone category — discourse now has the actual
-  diff to verify these against (previously it didn't; see `src/discourse.rs`'s `ctx` handling), but
-  an LLM can still be confidently wrong. Spot-check high-impact absence claims against the diff
+  diff to verify these against (previously it didn't; see `src/discourse/mod.rs`'s `ctx` handling),
+  but an LLM can still be confidently wrong. Spot-check high-impact absence claims against the diff
   before acting on them.
+- A `P0`/`P1` finding that discourse couldn't reach consensus on (`UNCERTAIN` — see the "Needs
+  Human Review" section of `report.md`) forces `verdict` to `NEEDS_CONTEXT` rather than letting it
+  fall through to `APPROVE`/`COMMENT` — but this only covers `UNCERTAIN` specifically; still read
+  the "Needs Human Review" section yourself, since `MERGED`/omitted entries there aren't reflected
+  in the verdict at all.
 - Move whatever you can out of LLM judgment and into `--deterministic-results` (see the worked
   example above) — anything mechanically checkable shouldn't be left for the LLM to assert and
   potentially contradict itself on across discourse rounds.
