@@ -370,8 +370,9 @@ sequenceDiagram
   provider is configured, verbatim — neither backend redacts secrets or PII before sending. A
   one-line warning prints to stderr on every run as a reminder; don't run this against code
   containing secrets or restricted data unless that's acceptable for your org. Before sending, a
-  local pattern-based scan checks the diff's added lines, plus `--requirements`/`--conventions`
-  content, for things that look like credentials (AWS/GitHub/Slack tokens, PEM private keys,
+  local pattern-based scan checks every line of the diff (added, removed, and context — not
+  just added lines, since the whole diff is what's actually sent), plus `--requirements`/
+  `--conventions` content, for things that look like credentials (AWS/GitHub/Slack tokens, PEM private keys,
   JWTs, `.env`-style secret assignments) and refuses
   to proceed if it finds one — pass `--allow-sensitive-input` to send it anyway. This is a
   best-effort heuristic scan, not a real secret scanner (no entropy analysis, no provider-specific
