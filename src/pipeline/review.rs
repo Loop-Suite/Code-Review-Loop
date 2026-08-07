@@ -266,6 +266,11 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
             }
         }
     };
+    // #139: discourse's SURFACE moves can add brand-new findings straight into `findings`
+    // (src/discourse/mod.rs) without ever going through evidence::verify — the earlier call at
+    // the top of this function only saw the original per-lens findings. Re-running here is
+    // idempotent for findings already checked and catches every SURFACEd one too.
+    evidence::verify(&mut findings, &inp.diff);
 
     // Compared to the previous round (--prior): determine whether previously confirmed findings
     // were fixed in this diff. If STILL_OPEN, re-fold them into this round's working set (keeps affecting score/verdict).
@@ -577,6 +582,88 @@ always = true
         assert!(
             std::fs::metadata(out_dir.join("state.json")).is_ok(),
             "state.json should be written for --prior to pick up next round"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_review_flags_a_discourse_surfaced_finding_whose_file_line_does_not_exist_in_the_diff() {
+        // #139: evidence::verify used to only run once, before discourse — a finding added via
+        // a SURFACE move never got checked at all and rendered as if it had passed verification.
+        let dir = std::env::temp_dir().join("codereview-loop-e2e-surface-evidence-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let spec_path = dir.join("spec.toml");
+        write_file(
+            &spec_path,
+            r#"
+name = "e2e test spec"
+labels = ["possible bug"]
+
+[[lenses]]
+id = "test_lens"
+title = "Test Lens"
+guide = "test"
+always = true
+"#,
+        );
+
+        let diff_path = dir.join("diff.patch");
+        write_file(
+            &diff_path,
+            "diff --git a/src/example.rs b/src/example.rs\n\
+             --- a/src/example.rs\n\
+             +++ b/src/example.rs\n\
+             @@ -1,1 +1,1 @@\n\
+             -old line\n\
+             +new line\n",
+        );
+
+        let out_dir = dir.join("out");
+
+        let lens_response = r#"{"findings":[{"file":"src/example.rs","line":"1","claim":"real claim","evidence":"real evidence","impact":"","severity":"P1","label":"possible bug","confidence":"high","recommendation":""}],"unverified":[]}"#.to_string();
+        // "surfaced" finding cites line 999, which doesn't exist anywhere in the 3-line diff
+        // above — nothing in "resolutions" targets it, so it stays UNCERTAIN and shows up in
+        // the "Needs Human Review" table, where the evidence_unverified marker is checked.
+        let discourse_response = r#"{"moves":[{"move":"CHALLENGE","lens":"reviewer","target":"test_lens-r1-1","detail":"needs more evidence","new_evidence":"","confidence":"medium"}],"resolutions":[],"surfaced":[{"file":"src/example.rs","line":"999","claim":"hallucinated claim","evidence":"hallucinated evidence","impact":"","severity":"P2","label":"possible bug","confidence":"medium","recommendation":""}]}"#.to_string();
+
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![lens_response, discourse_response], 0, usage.clone());
+        let cheap_llm = llm.clone();
+
+        run_review(
+            &llm,
+            &cheap_llm,
+            &ReviewArgs {
+                spec_path: &spec_path,
+                diff_path: &diff_path,
+                requirements_path: &None,
+                conventions_path: &None,
+                deterministic_results_path: &None,
+                lenses_arg: &None,
+                out: &out_dir,
+                concurrency: 1,
+                max_rounds: 1,
+                prior: &None,
+                human_voice: false,
+                lang: &None,
+                deadline_minutes: None,
+                allow_sensitive_input: false,
+            },
+        )
+        .expect("run_review should complete end-to-end against the fixture LLM");
+
+        let report =
+            std::fs::read_to_string(out_dir.join("report.md")).expect("report.md should exist");
+        assert!(
+            report.contains("hallucinated claim"),
+            "the surfaced finding should appear in the report:\n{report}"
+        );
+        assert!(
+            report.contains("src/example.rs:999 ⚠️ unverified"),
+            "the surfaced finding's fabricated line must be flagged unverified:\n{report}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
