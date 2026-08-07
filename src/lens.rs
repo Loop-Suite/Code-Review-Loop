@@ -97,6 +97,24 @@ pub struct LensOutput {
     pub findings: Vec<Finding>,
     #[serde(default)]
     pub unverified: Vec<String>,
+    /// #158: stays `#[serde(default)]` (empty string, not a hard requirement) — making it
+    /// serde-required would reintroduce the exact fragility the other fields were loosened to
+    /// avoid: one missing field killing the parse of an otherwise-valid `findings` array. Used
+    /// only to distinguish "the LLM engaged with the diff and found nothing" (summary present,
+    /// findings/unverified empty — a legitimately clean review) from "the response was
+    /// essentially a no-op that still happened to parse" (see `is_degenerate`).
+    #[serde(default)]
+    pub summary: String,
+}
+
+impl LensOutput {
+    /// True when nothing in the response indicates the LLM actually engaged with the diff —
+    /// no findings, no unverified suspicions, and no summary. A response of literally `{}`
+    /// used to count toward `successful_lens_count` exactly the same as a thorough review that
+    /// happened to find nothing, since both parse to this same all-defaulted shape.
+    pub fn is_degenerate(&self) -> bool {
+        self.findings.is_empty() && self.unverified.is_empty() && self.summary.trim().is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -203,10 +221,14 @@ fn build_review_task(spec: &Spec, lens_title: &str, lens_guide: &str) -> String 
          - Every finding requires file:line evidence. Suspicions without evidence go under unverified.\n\
          - severity must be one of P0 (critical) through P3 (minor).\n\
          - label must be exactly one of: {labels}\n\n\
+         - summary is required even when findings is empty: one sentence on what you actually\n\
+         looked at and whether you found anything, so an empty findings array is distinguishable\n\
+         from a response that didn't engage with the diff at all.\n\n\
          ## Output (JSON only, no code fences)\n\
          {{\"findings\":[{{\"file\":\"...\",\"line\":\"...\",\"claim\":\"...\",\"evidence\":\"...\",\
          \"impact\":\"...\",\"severity\":\"P0|P1|P2|P3\",\"label\":<one of the allowed values>,\
-         \"confidence\":\"high|medium|low\",\"recommendation\":\"...\"}}],\"unverified\":[\"...\"]}}\n",
+         \"confidence\":\"high|medium|low\",\"recommendation\":\"...\"}}],\"unverified\":[\"...\"],\
+         \"summary\":\"...\"}}\n",
         lens_title = lens_title,
         lens_guide = lens_guide,
         labels = spec.labels_prompt(),
@@ -444,6 +466,36 @@ mod tests {
         assert_eq!(out.findings.len(), 2);
         assert_eq!(out.findings[0].claim, "ok");
         assert_eq!(out.findings[1].evidence, "");
+    }
+
+    // --- #158: LensOutput::is_degenerate() ---
+
+    #[test]
+    fn is_degenerate_true_for_a_completely_empty_response() {
+        let out: LensOutput = serde_json::from_str("{}").unwrap();
+        assert!(out.is_degenerate());
+    }
+
+    #[test]
+    fn is_degenerate_false_when_summary_is_present_even_with_no_findings() {
+        // A genuinely clean, thoroughly-reviewed diff — summary present, nothing to report.
+        let out: LensOutput =
+            serde_json::from_str(r#"{"summary":"Reviewed the diff, no issues found."}"#).unwrap();
+        assert!(!out.is_degenerate());
+    }
+
+    #[test]
+    fn is_degenerate_false_when_findings_are_present_even_without_a_summary() {
+        let json = r#"{"findings":[{"file":"a.rs","line":"1","claim":"ok","evidence":"e","severity":"P1","label":"possible bug"}]}"#;
+        let out: LensOutput = serde_json::from_str(json).unwrap();
+        assert!(!out.is_degenerate());
+    }
+
+    #[test]
+    fn is_degenerate_false_when_unverified_is_present() {
+        let out: LensOutput =
+            serde_json::from_str(r#"{"unverified":["suspicious but no evidence"]}"#).unwrap();
+        assert!(!out.is_degenerate());
     }
 
     #[test]
