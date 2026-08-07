@@ -72,7 +72,7 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
         args.deterministic_results_path,
         args.lang.clone(),
     )?;
-    enforce_secret_scan(&inp.diff, args.allow_sensitive_input)?;
+    enforce_secret_scan(&inp, args.allow_sensitive_input)?;
     // Not a hard cap — since the full diff is resent on every lens/discourse/verify call, this
     // just gives an early warning that token cost grows more than linearly with diff size (no silent truncation).
     const DIFF_WARN_CHARS: usize = 300_000;
