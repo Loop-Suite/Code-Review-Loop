@@ -377,7 +377,11 @@ sequenceDiagram
   best-effort heuristic scan, not a real secret scanner (no entropy analysis, no provider-specific
   formats beyond the ones listed) — it catches the obvious cases, not everything.
 - heuristic-only policy signals for behavior vs surface changes can produce false
-  positives depending on project structure.
+  positives depending on project structure. The default spec's test/doc policy is presence-only
+  (some test/doc file appears anywhere in the diff, not mapped per changed file) and strict
+  enough that even this project's own "clean diff" eval fixture needed a padded test+changelog
+  change to pass it — treat `specs/default.toml` as a starting point to adapt to your repo's
+  conventions, not a lenient default.
 - severity penalties are heuristic defaults (P0: 25, P1: 12, P2: 5, P3: 1) — configurable per
   spec via an optional `[scoring]` table (`p0`/`p1`/`p2`/`p3`); unset fields keep their default,
   so a partial table only overrides what it mentions. Effort/time budgets (`quantify.rs`'s
