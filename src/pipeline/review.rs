@@ -299,13 +299,16 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
                     .unwrap_or(false)
             })
             .collect();
-        // #117: on failure, just skip re-folding for this round (fix_results stays empty)
-        // instead of aborting the whole run via `?` — a --prior fixcheck failure shouldn't
-        // discard every lens/discourse result already computed above.
+        // #117/#135: on failure or a deadline skip, don't just drop fix_results to empty — that
+        // used to mean the re-fold loop below (which only re-adds STILL_OPEN entries) silently
+        // dropped every prior-round CONFIRMED finding from this round's score/verdict instead of
+        // erring toward "still open, keep counting it." fill_missing_as_still_open (normally
+        // just fixcheck::run's own "the LLM omitted this id" safety net) does exactly that
+        // synthesis when handed an empty results list — every prior_confirmed id is "missing."
         fix_results = if deadline_exceeded(started, args.deadline_minutes) {
             eprintln!("Warning: --deadline-minutes exceeded — skipping fix check");
             stage_errors.push("fixcheck: skipped, --deadline-minutes exceeded".to_string());
-            Vec::new()
+            fixcheck::fill_missing_as_still_open(Vec::new(), &prior_confirmed)
         } else {
             match fixcheck::run(
                 cheap_llm,
@@ -318,7 +321,7 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
                 Err(e) => {
                     eprintln!("Warning: fix check failed — {e:#}");
                     stage_errors.push(format!("fixcheck: {e:#}"));
-                    Vec::new()
+                    fixcheck::fill_missing_as_still_open(Vec::new(), &prior_confirmed)
                 }
             }
         };
@@ -329,8 +332,14 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
         // still defensively check the same id doesn't get added twice in this loop. SUPERSEDED
         // isn't STILL_OPEN to begin with, so it's naturally excluded from re-folding below
         // (residual limitation: doesn't catch cases where fixcheck's LLM judgment mislabels something as SUPERSEDED).
+        //
+        // #135: UNKNOWN re-folds the same way as STILL_OPEN — corroborate() (fixcheck.rs)
+        // downgrades a wrongly-FIXED verdict to UNKNOWN specifically to protect a finding whose
+        // evidence is still present verbatim, but UNKNOWN wasn't previously re-folded at all, so
+        // that protection ended in the same silent drop it was built to prevent. "We don't know
+        // it's fixed" must mean "keep counting it," same as an explicit STILL_OPEN.
         for fr in &fix_results {
-            if fr.status == "STILL_OPEN" {
+            if fr.status == "STILL_OPEN" || fr.status == "UNKNOWN" {
                 if let Some(orig) = prior_confirmed.iter().find(|f| f.id == fr.finding_id) {
                     if findings.iter().any(|f| f.id == orig.id) {
                         continue;
@@ -984,6 +993,252 @@ always = true
         assert!(
             err.to_string().contains("always"),
             "expected an always-lens rejection error, got: {err}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn prior_confirmed_p0_finding() -> Finding {
+        Finding {
+            id: "prior-r1-1".to_string(),
+            file: "src/example.rs".to_string(),
+            line: "1".to_string(),
+            claim: "prior round SQL injection".to_string(),
+            evidence: "prior evidence".to_string(),
+            impact: String::new(),
+            severity: "P0".to_string(),
+            label: "security".to_string(),
+            confidence: "high".to_string(),
+            recommendation: String::new(),
+            lens: "security".to_string(),
+            reviewer: "Reviewer".to_string(),
+            evidence_unverified: false,
+        }
+    }
+
+    fn write_prior_state(dir: &std::path::Path, finding: Finding) -> std::path::PathBuf {
+        let prior_dir = dir.join("prior");
+        std::fs::create_dir_all(&prior_dir).unwrap();
+        let mut resolved = std::collections::HashMap::new();
+        resolved.insert(
+            finding.id.clone(),
+            discourse::Resolution {
+                finding_id: finding.id.clone(),
+                status: "CONFIRMED".to_string(),
+                merged_into: String::new(),
+                reason: "confirmed in round 1".to_string(),
+            },
+        );
+        state::write(&prior_dir, &state::State::new(1, vec![finding], resolved)).unwrap();
+        prior_dir
+    }
+
+    #[test]
+    fn run_review_still_carries_a_prior_confirmed_finding_when_fixcheck_itself_fails() {
+        // #135: a --prior fixcheck call that fails outright (LLM error, here simulated by an
+        // exhausted fixture queue) used to leave fix_results empty, silently dropping every
+        // prior-round CONFIRMED finding from this round's score/verdict instead of erring
+        // toward "still open, keep counting it."
+        let dir = std::env::temp_dir().join("codereview-loop-e2e-prior-fixcheck-failure-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let spec_path = dir.join("spec.toml");
+        write_file(
+            &spec_path,
+            "name = \"e2e test spec\"\nlabels = [\"possible bug\"]\n\n[[lenses]]\nid = \"test_lens\"\ntitle = \"Test Lens\"\nguide = \"test\"\nalways = true\n",
+        );
+        let diff_path = dir.join("diff.patch");
+        write_file(
+            &diff_path,
+            "diff --git a/src/example.rs b/src/example.rs\n\
+             --- a/src/example.rs\n\
+             +++ b/src/example.rs\n\
+             @@ -1,1 +1,1 @@\n\
+             -old line\n\
+             +new line\n",
+        );
+        let prior_dir = write_prior_state(&dir, prior_confirmed_p0_finding());
+        let out_dir = dir.join("out");
+
+        // Only one response queued — enough for round 2's lens call (no new findings, so
+        // discourse gets skipped entirely: "No findings — skipping discourse"). By the time
+        // fixcheck::run() tries its own LLM call, the fixture queue is empty, so it fails.
+        let lens_response = r#"{"findings":[],"unverified":[]}"#.to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![lens_response], 0, usage.clone());
+        let cheap_llm = llm.clone();
+
+        run_review(
+            &llm,
+            &cheap_llm,
+            &ReviewArgs {
+                spec_path: &spec_path,
+                diff_path: &diff_path,
+                requirements_path: &None,
+                conventions_path: &None,
+                deterministic_results_path: &None,
+                lenses_arg: &None,
+                out: &out_dir,
+                concurrency: 1,
+                max_rounds: 1,
+                prior: &Some(prior_dir),
+                human_voice: false,
+                lang: &None,
+                deadline_minutes: None,
+                allow_sensitive_input: false,
+            },
+        )
+        .expect("run_review should complete even though fixcheck itself fails");
+
+        let report =
+            std::fs::read_to_string(out_dir.join("report.md")).expect("report.md should exist");
+        assert!(
+            report.contains("prior round SQL injection"),
+            "the prior-round CONFIRMED P0 must still be carried into this round:\n{report}"
+        );
+        assert!(
+            report.contains("Verdict: REQUEST_CHANGES"),
+            "a carried-over confirmed P0 must still drive the verdict:\n{report}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_review_still_carries_a_prior_confirmed_finding_when_the_deadline_is_already_exceeded() {
+        // #135: the --deadline-minutes skip path had the same bug as the outright-failure path
+        // — fix_results stayed empty, so a --deadline-minutes run always silently dropped every
+        // prior-round CONFIRMED finding, deadline or not.
+        let dir = std::env::temp_dir().join("codereview-loop-e2e-prior-deadline-skip-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let spec_path = dir.join("spec.toml");
+        write_file(
+            &spec_path,
+            "name = \"e2e test spec\"\nlabels = [\"possible bug\"]\n\n[[lenses]]\nid = \"test_lens\"\ntitle = \"Test Lens\"\nguide = \"test\"\nalways = true\n",
+        );
+        let diff_path = dir.join("diff.patch");
+        write_file(
+            &diff_path,
+            "diff --git a/src/example.rs b/src/example.rs\n\
+             --- a/src/example.rs\n\
+             +++ b/src/example.rs\n\
+             @@ -1,1 +1,1 @@\n\
+             -old line\n\
+             +new line\n",
+        );
+        let prior_dir = write_prior_state(&dir, prior_confirmed_p0_finding());
+        let out_dir = dir.join("out");
+
+        let lens_response = r#"{"findings":[],"unverified":[]}"#.to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![lens_response], 0, usage.clone());
+        let cheap_llm = llm.clone();
+
+        run_review(
+            &llm,
+            &cheap_llm,
+            &ReviewArgs {
+                spec_path: &spec_path,
+                diff_path: &diff_path,
+                requirements_path: &None,
+                conventions_path: &None,
+                deterministic_results_path: &None,
+                lenses_arg: &None,
+                out: &out_dir,
+                concurrency: 1,
+                max_rounds: 1,
+                prior: &Some(prior_dir),
+                human_voice: false,
+                lang: &None,
+                // Already exceeded by the time fixcheck would run.
+                deadline_minutes: Some(0),
+                allow_sensitive_input: false,
+            },
+        )
+        .expect("run_review should complete even with the deadline already exceeded");
+
+        let report =
+            std::fs::read_to_string(out_dir.join("report.md")).expect("report.md should exist");
+        assert!(
+            report.contains("prior round SQL injection"),
+            "the prior-round CONFIRMED P0 must still be carried into this round:\n{report}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn run_review_still_carries_a_prior_confirmed_finding_downgraded_to_unknown() {
+        // #135: fixcheck::corroborate() downgrades a wrongly-FIXED verdict to UNKNOWN when the
+        // original evidence is still present verbatim in the diff — but UNKNOWN wasn't
+        // previously re-folded (only STILL_OPEN was), so this safety net produced the exact
+        // silent drop it was built to prevent.
+        let dir = std::env::temp_dir().join("codereview-loop-e2e-prior-unknown-test");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let spec_path = dir.join("spec.toml");
+        write_file(
+            &spec_path,
+            "name = \"e2e test spec\"\nlabels = [\"possible bug\"]\n\n[[lenses]]\nid = \"test_lens\"\ntitle = \"Test Lens\"\nguide = \"test\"\nalways = true\n",
+        );
+        let diff_path = dir.join("diff.patch");
+        // The added line deliberately still contains the prior finding's evidence text
+        // verbatim, so corroborate() downgrades a FIXED verdict to UNKNOWN.
+        write_file(
+            &diff_path,
+            "diff --git a/src/example.rs b/src/example.rs\n\
+             --- a/src/example.rs\n\
+             +++ b/src/example.rs\n\
+             @@ -1,1 +1,1 @@\n\
+             -old line\n\
+             +still has prior evidence right here\n",
+        );
+        let prior_dir = write_prior_state(&dir, prior_confirmed_p0_finding());
+        let out_dir = dir.join("out");
+
+        let lens_response = r#"{"findings":[],"unverified":[]}"#.to_string();
+        let fixcheck_response =
+            r#"{"results":[{"finding_id":"prior-r1-1","status":"FIXED","evidence":"looks fixed"}]}"#
+                .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![lens_response, fixcheck_response], 0, usage.clone());
+        let cheap_llm = llm.clone();
+
+        run_review(
+            &llm,
+            &cheap_llm,
+            &ReviewArgs {
+                spec_path: &spec_path,
+                diff_path: &diff_path,
+                requirements_path: &None,
+                conventions_path: &None,
+                deterministic_results_path: &None,
+                lenses_arg: &None,
+                out: &out_dir,
+                concurrency: 1,
+                max_rounds: 1,
+                prior: &Some(prior_dir),
+                human_voice: false,
+                lang: &None,
+                deadline_minutes: None,
+                allow_sensitive_input: false,
+            },
+        )
+        .expect("run_review should complete");
+
+        let report =
+            std::fs::read_to_string(out_dir.join("report.md")).expect("report.md should exist");
+        assert!(
+            report.contains("prior round SQL injection"),
+            "a finding downgraded to UNKNOWN must still be carried into this round:\n{report}"
+        );
+        assert!(
+            report.contains("Verdict: REQUEST_CHANGES"),
+            "the carried-over P0 must still drive the verdict:\n{report}"
         );
 
         let _ = std::fs::remove_dir_all(&dir);
