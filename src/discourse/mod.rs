@@ -103,10 +103,25 @@ pub fn run(
             // MERGED resolution naming a merged_into that isn't an actual finding id would
             // otherwise vanish (excluded from `confirmed` as MERGED, but its vote weight never
             // credited to anything real either, since the target it names doesn't exist).
-            if r.status == "MERGED" && !findings.iter().any(|f| f.id == r.merged_into) {
+            // #154: merged_into == the finding's own id passed the "is this a real finding"
+            // check above trivially (a finding is always real relative to itself) — a
+            // self-merge silently sank the finding into MERGED with its vote weight credited
+            // nowhere, the same disappearing-act the check above exists to prevent.
+            let merges_into_self = r.status == "MERGED" && r.merged_into == r.finding_id;
+            if r.status == "MERGED"
+                && (merges_into_self || !findings.iter().any(|f| f.id == r.merged_into))
+            {
+                let problem = if merges_into_self {
+                    "merged_into is the finding's own id (self-merge)".to_string()
+                } else {
+                    format!(
+                        "merged_into(\"{}\") is not among this round's findings",
+                        r.merged_into
+                    )
+                };
                 r.reason = format!(
-                    "{} [Verification failed: merged_into(\"{}\") is not among this round's findings — safely reverted to UNCERTAIN]",
-                    r.reason, r.merged_into
+                    "{} [Verification failed: {problem} — safely reverted to UNCERTAIN]",
+                    r.reason
                 );
                 r.status = "UNCERTAIN".to_string();
             }
@@ -478,6 +493,54 @@ mod tests {
         assert_ne!(
             resolved["a"].status, "MERGED",
             "a MERGED resolution naming a nonexistent merged_into must not stand as-is"
+        );
+    }
+
+    #[test]
+    fn run_reverts_a_merged_resolution_that_merges_a_finding_into_itself() {
+        // #154: merged_into == the finding's own id passes the "is this a real finding" check
+        // trivially — a self-merge used to silently sink the finding into MERGED status.
+        let mut findings = vec![test_finding("a claim", "evidence")];
+        findings[0].id = "a".to_string();
+
+        let response = serde_json::json!({
+            "moves": [{
+                "move": "CHALLENGE", "lens": "tests", "target": "nonexistent-target",
+                "detail": "d", "confidence": "high", "challenge_axis": "existence"
+            }],
+            "resolutions": [{
+                "finding_id": "a", "status": "MERGED",
+                "merged_into": "a", "reason": "merged into itself"
+            }],
+            "surfaced": []
+        })
+        .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+        let input = Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+            config: crate::core::RunConfig::default(),
+        };
+
+        let (_audit, resolved) = run(
+            &llm,
+            &super::test_support::test_spec(),
+            &input,
+            &mut findings,
+            1,
+            1,
+        )
+        .unwrap();
+
+        assert_ne!(
+            resolved["a"].status, "MERGED",
+            "a finding merged into itself must not stand as MERGED"
         );
     }
 
