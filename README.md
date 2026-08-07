@@ -357,7 +357,10 @@ sequenceDiagram
   cap is character-based, not token-based — a rough ~4-chars-per-token estimate is included in
   the large-diff warning for context, but it isn't a real per-provider/model tokenizer, so it can
   trigger too early or too late relative to the actual context window depending on the diff's
-  language/content.
+  language/content. It's also an approximate bound, not an exact one (the trailing note/join
+  overhead can push the actual output a few hundred bytes past it), and it only applies to the
+  diff — `--requirements`/`--conventions` content has no cap of its own; only the size *warning*
+  (300k-char threshold) accounts for all three together.
 - `claude -p` runtime depends on repository size and prompt density; expect seconds to
   minutes per run.
 

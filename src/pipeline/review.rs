@@ -73,14 +73,25 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
         args.lang.clone(),
     )?;
     enforce_secret_scan(&inp, args.allow_sensitive_input)?;
-    // Not a hard cap — since the full diff is resent on every lens/discourse/verify call, this
-    // just gives an early warning that token cost grows more than linearly with diff size (no silent truncation).
+    // Not a hard cap — since the full diff (plus requirements/conventions) is resent on every
+    // lens/discourse/verify call, this just gives an early warning that token cost grows more
+    // than linearly with input size (no silent truncation). #142: requirements/conventions used
+    // to be excluded from this warning entirely, despite being sent to the LLM the same way and
+    // having no size cap of their own (unlike the diff, which prioritize_and_cap_diff bounds).
     const DIFF_WARN_CHARS: usize = 300_000;
-    if inp.diff.len() > DIFF_WARN_CHARS {
+    let requirements_len = inp.requirements.as_deref().map(str::len).unwrap_or(0);
+    let conventions_len = inp.conventions.as_deref().map(str::len).unwrap_or(0);
+    let total_context_len = inp.diff.len() + requirements_len + conventions_len;
+    if total_context_len > DIFF_WARN_CHARS {
+        let est_tokens = input::estimate_tokens(&inp.diff)
+            + input::estimate_tokens(inp.requirements.as_deref().unwrap_or(""))
+            + input::estimate_tokens(inp.conventions.as_deref().unwrap_or(""));
         eprintln!(
-            "Warning: diff is {} characters (~{} tokens estimated), which is large — the full diff is resent on every lens review/discourse/requirements call, driving up token cost",
-            inp.diff.len(),
-            input::estimate_tokens(&inp.diff)
+            "Warning: diff+requirements+conventions is {total_context_len} characters total \
+             (diff {}, requirements {requirements_len}, conventions {conventions_len}; \
+             ~{est_tokens} tokens estimated), which is large — the full diff is resent on every \
+             lens review/discourse/requirements call, driving up token cost",
+            inp.diff.len()
         );
     }
     if inp.deterministic_results.is_none() {
