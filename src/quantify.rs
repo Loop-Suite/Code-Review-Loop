@@ -59,14 +59,17 @@ fn score(
     for f in findings {
         if resolved.get(&f.id).map(|r| r.status.as_str()) == Some("CONFIRMED") {
             let p = severity_penalty(scoring, &f.severity);
-            total -= p;
+            total = total.saturating_sub(p);
             deductions.push(format!(
                 "[{}] {}:{} -{} pts — {}",
                 f.severity, f.file, f.line, p, f.claim
             ));
         }
     }
-    (total.max(0), deductions)
+    // #146: Spec::load now validates each scoring.pN into 0..=100, but clamping both ends here
+    // too is cheap defense in depth against a `Finding` built directly (not via Spec::load —
+    // e.g. a future caller, or a test) with an out-of-range ScoringConfig.
+    (total.clamp(0, 100), deductions)
 }
 
 /// Estimated review effort based on change size. Assumption: the thresholds are a design choice (uncertain), should be adjusted per team size.
@@ -262,6 +265,25 @@ mod tests {
         }
         let (sc, _) = score(&ScoringConfig::default(), &findings, &resolved);
         assert_eq!(sc, 0);
+    }
+
+    #[test]
+    fn score_clamps_at_100_even_with_a_scoring_config_that_bypassed_spec_load_validation() {
+        // #146: Spec::load now rejects a negative penalty, but score() defensively clamps the
+        // upper end too — in case a ScoringConfig is ever built directly rather than parsed
+        // from spec.toml.
+        let scoring = ScoringConfig {
+            p0: -50,
+            ..Default::default()
+        };
+        let findings = vec![finding("a", "P0")];
+        let mut resolved = HashMap::new();
+        resolved.insert("a".to_string(), resolution("a", "CONFIRMED"));
+        let (sc, _) = score(&scoring, &findings, &resolved);
+        assert_eq!(
+            sc, 100,
+            "score must never exceed 100 regardless of penalty sign"
+        );
     }
 
     #[test]
