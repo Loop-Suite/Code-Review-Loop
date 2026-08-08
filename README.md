@@ -397,7 +397,14 @@ sequenceDiagram
   JWTs, `.env`-style secret assignments) and refuses
   to proceed if it finds one — pass `--allow-sensitive-input` to send it anyway. This is a
   best-effort heuristic scan, not a real secret scanner (no entropy analysis, no provider-specific
-  formats beyond the ones listed) — it catches the obvious cases, not everything.
+  formats beyond the ones listed) — it catches the obvious cases, not everything. Scope boundary,
+  spelled out since "no redaction" undersells how narrow this is: it is credential-*pattern*
+  matching only. It is not PII detection (no names/emails/phone numbers/addresses/government IDs),
+  not a path allowlist/denylist (no way to say "never send anything under `secrets/` or
+  `infra/prod/` regardless of content"), not an audit log of what was actually transmitted to
+  which provider, and not any data-residency or no-retention enforcement on the provider side. For
+  a repo with PII references or compliance-scoped paths, that gap is real — content scanners
+  always miss things path rules wouldn't.
 - heuristic-only policy signals for behavior vs surface changes can produce false
   positives depending on project structure. The default spec's test/doc policy is presence-only
   (some test/doc file appears anywhere in the diff, not mapped per changed file) and strict
