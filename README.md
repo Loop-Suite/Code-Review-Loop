@@ -415,7 +415,16 @@ sequenceDiagram
   spec via an optional `[scoring]` table (`p0`/`p1`/`p2`/`p3`); unset fields keep their default,
   so a partial table only overrides what it mentions. Effort/time budgets (`quantify.rs`'s
   `effort_and_time`) are still hardcoded — there's no config field for those yet.
-- fixed persona mapping (e.g., design→Fowler) is customizable but opinionated.
+- fixed persona mapping (e.g., design→Fowler) is customizable but opinionated. More importantly:
+  persona diversity is not model diversity. Every lens, the discourse pass, and the judge draw
+  from the same underlying model by default — differentiated only by system prompt. The premise
+  behind running multiple "reviewers" at all is that their errors are somewhat independent, so
+  cross-verification catches something a single pass would miss; three personas answering as the
+  same model are far more likely to share failure modes than genuinely different models would be.
+  A `model` field on a `[[lenses]]` entry in spec.toml overrides `--model`/`--cheap-model` for
+  just that lens (works with `--backend openrouter`/`custom`, where distinct model ids resolve to
+  distinct endpoints) — set it on one or two lenses to actually test whether model diversity
+  changes what gets caught, rather than assuming persona diversity already covers it.
 - `--prior` assumes compatible finding identity across re-runs with the same spec.
 - repository-independent claim matching can become noisy when file renames are common
   without supporting heuristics.

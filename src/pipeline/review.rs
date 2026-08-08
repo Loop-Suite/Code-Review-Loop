@@ -90,6 +90,21 @@ fn deterministic_tool_timeout(
 
 type LensReviewResults = Vec<Result<(String, lens::LensOutput)>>;
 
+/// #162: a lens with a `model` override in its spec runs on a clone of `llm` with just that
+/// field swapped — same provider/gate/usage tracker/calls_log, different model id. Returns
+/// `None` when no override applies (the overwhelmingly common case), so callers can fall back
+/// to the shared `llm` reference without an allocation.
+fn lens_specific_llm(llm: &Llm, sp: &Spec, id: &str) -> Option<Llm> {
+    let lens = sp.lenses.iter().find(|l| l.id == id)?;
+    let model = lens.model.as_ref()?;
+    if llm.model.as_ref() == Some(model) {
+        return None;
+    }
+    let mut overridden = llm.clone();
+    overridden.model = Some(model.clone());
+    Some(overridden)
+}
+
 /// Shared by both the mandatory-lens and optional-lens `par_map` calls (#168) — kept as one
 /// plain fn instead of a closure defined twice so the "lens complete" logging can't drift
 /// between the two call sites.
@@ -100,7 +115,9 @@ fn review_one_lens(
     id: &str,
     round: usize,
 ) -> Result<(String, lens::LensOutput)> {
-    let out = lens::review_lens(llm, sp, inp, id, round)?;
+    let overridden = lens_specific_llm(llm, sp, id);
+    let effective_llm = overridden.as_ref().unwrap_or(llm);
+    let out = lens::review_lens(effective_llm, sp, inp, id, round)?;
     println!(
         "  Lens complete: {} — {} findings, {} unverified",
         id,
@@ -666,6 +683,75 @@ mod e2e_tests {
         }
         let mut f = std::fs::File::create(path).unwrap();
         f.write_all(content.as_bytes()).unwrap();
+    }
+
+    fn spec_with_lens_models(dir: &std::path::Path) -> Spec {
+        let spec_path = dir.join("model-override-spec.toml");
+        write_file(
+            &spec_path,
+            r#"
+name = "model override test spec"
+labels = ["possible bug"]
+
+[[lenses]]
+id = "no_override"
+title = "No Override"
+always = true
+
+[[lenses]]
+id = "same_as_shared"
+title = "Same As Shared"
+always = true
+model = "shared-model"
+
+[[lenses]]
+id = "different_model"
+title = "Different Model"
+always = true
+model = "diverse-model"
+"#,
+        );
+        Spec::load(&spec_path).unwrap()
+    }
+
+    #[test]
+    fn lens_specific_llm_returns_none_for_a_lens_with_no_model_field() {
+        let dir = std::env::temp_dir().join("codereview-loop-lens-specific-llm-test-1");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sp = spec_with_lens_models(&dir);
+        let mut llm = Llm::fixture(vec![], 0, Llm::new_usage_tracker());
+        llm.model = Some("shared-model".to_string());
+
+        assert!(lens_specific_llm(&llm, &sp, "no_override").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lens_specific_llm_returns_none_when_the_override_matches_the_shared_model() {
+        let dir = std::env::temp_dir().join("codereview-loop-lens-specific-llm-test-2");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sp = spec_with_lens_models(&dir);
+        let mut llm = Llm::fixture(vec![], 0, Llm::new_usage_tracker());
+        llm.model = Some("shared-model".to_string());
+
+        assert!(lens_specific_llm(&llm, &sp, "same_as_shared").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn lens_specific_llm_returns_an_overridden_clone_when_the_lens_names_a_different_model() {
+        let dir = std::env::temp_dir().join("codereview-loop-lens-specific-llm-test-3");
+        std::fs::create_dir_all(&dir).unwrap();
+        let sp = spec_with_lens_models(&dir);
+        let mut llm = Llm::fixture(vec![], 0, Llm::new_usage_tracker());
+        llm.model = Some("shared-model".to_string());
+
+        let overridden = lens_specific_llm(&llm, &sp, "different_model").unwrap();
+        assert_eq!(overridden.model.as_deref(), Some("diverse-model"));
+        // Everything else about the lens's own shared client (usage tracker, gate, etc.) still
+        // comes along via the clone — only `model` diverges from `llm`.
+        assert_eq!(overridden.retries, llm.retries);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
