@@ -32,6 +32,9 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Default, Serialize)]
 pub(crate) struct StageTimings {
     pub(crate) semgrep_ms: Option<u128>,
+    /// #164: absent for the same reason semgrep_ms is — never spawned when deterministic_results
+    /// was already supplied externally.
+    pub(crate) cargo_audit_ms: Option<u128>,
     /// Combined: lens selection (when --lenses isn't given) and mandatory-lens review run
     /// concurrently (#168), followed by optional-lens review once selection returns.
     pub(crate) lens_selection_and_review_ms: u128,

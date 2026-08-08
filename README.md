@@ -72,6 +72,8 @@ It favors traceability and auditability:
 - `claude` CLI in PATH (for LLM-backed review modes, default backend) —
   or `--backend openrouter` with `OPENROUTER_API_KEY` set, which needs no `claude` CLI
 - optional: `semgrep` for local deterministic SAST/secrets/semi-static checks
+- optional: `cargo-audit` (`cargo install cargo-audit`) for local deterministic dependency
+  vulnerability checks
 
 ### Build
 
@@ -273,17 +275,31 @@ flowchart TD
 
 ### External tool output (non-judged)
 
-`--deterministic-results` expects the tool's own per-check JSON shape —
-`{ "<check_id>": { "status": "...", "evidence": "..." }, ... }` keyed by the ids in
-`spec.deterministic_checks` (e.g. `sast`, `secrets`) — not raw `semgrep --json` output, which has
-a different top-level shape (`results`/`errors`/`paths`) and will silently read back as `NOT_RUN`
-for every check if passed through directly.
-If not provided, and if `semgrep` is available, Code-Review-Loop currently executes:
+`--deterministic-results` expects the tool's own per-check JSON shape — a flat JSON object whose
+values are each an object with a `status` field:
 
-`semgrep --config=auto`
+```json
+{ "<check_id>": { "status": "pass" | "fail" | "error", "evidence": "..." }, ... }
+```
 
-It fills only SAST and secret-like checks; SCA/taint/deprecation remain `NOT_RUN` unless available
-by upstream tooling. Those results are presented as-is and are **not re-decided by LLM**.
+Any top-level key name is accepted (not restricted to a fixed set) — `quantify::deterministic_gate`
+only reads `status` off each entry, keyed by the ids in `spec.deterministic_checks` (e.g. `sast`,
+`secrets`, `dependency_sca`). A single `"fail"` anywhere forces `REQUEST_CHANGES` immediately; an
+`"error"` (with no `"fail"` present) forces `NEEDS_CONTEXT`; this is **not raw tool output** —
+`semgrep --json` and `cargo audit --json` each have their own top-level shape
+(`results`/`errors`/`paths` for semgrep, `vulnerabilities`/`warnings` for cargo-audit) and will
+silently read back as `NOT_RUN` for every check if passed through directly instead of translated
+into the shape above.
+
+If not provided, Code-Review-Loop auto-runs whichever of these is available on `PATH`, in the
+background, concurrently with lens review — neither blocks the other:
+
+- `semgrep --config=auto` — fills `sast`/secret-like checks
+- `cargo audit --json` — fills `dependency_sca`
+
+Results from both are merged by key, not overwritten by whichever finishes second. SCA/taint/
+deprecation checks outside what these two cover remain `NOT_RUN` unless supplied externally. Those
+results are presented as-is and are **not re-decided by LLM**.
 
 **Worked example — move a mechanically-checkable claim out of LLM judgment.** A lens/discourse
 finding might claim "this `dispose()` doesn't cancel the `StreamSubscription` it created." That's
@@ -313,7 +329,7 @@ flowchart TD
         voice2["Human-voice rewriting"]
     end
     subgraph ext["External tool output (non-judged)"]
-        semgrep2["semgrep --config=auto<br/><sub>or --deterministic-results file</sub>"]
+        semgrep2["semgrep --config=auto<br/><sub>or cargo audit --json<br/>or --deterministic-results file</sub>"]
     end
     llm --> det
     ext --> det
