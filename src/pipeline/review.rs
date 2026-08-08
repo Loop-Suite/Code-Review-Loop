@@ -574,6 +574,7 @@ pub(crate) fn run_review(llm: &Llm, cheap_llm: &Llm, args: &ReviewArgs) -> Resul
             requirements_and_human_voice_ms,
             total_ms: started.elapsed().as_millis(),
         },
+        llm.calls(),
     )
     .and_then(|m| manifest::write(&out_dir, &m))
     {
