@@ -1,0 +1,1148 @@
+//! Cross-verification layer: after each lens independently reviews the diff, discourse runs
+//! rounds where lenses challenge/agree on each other's findings and reach a resolution.
+//!
+//! #130: split out of one large file along its natural seams — schema (wire format + LLM-output
+//! normalization), prompt (system prompt + per-round prompt construction), votes (confidence
+//! tallying), leaving this file with just the orchestration loop itself.
+mod prompt;
+mod schema;
+#[cfg(test)]
+mod test_support;
+mod votes;
+
+pub use schema::{Move, Resolution};
+
+use crate::input::Input;
+use crate::lens::Finding;
+use crate::llm::Llm;
+use crate::promptctx::shared_context;
+use crate::spec::Spec;
+use anyhow::{Context, Result};
+use prompt::{build_round_prompt, DISCOURSE_SYSTEM};
+use schema::{
+    normalize_challenge_axis, normalize_confidence, normalize_move_kind, normalize_status,
+    surface_id, DiscourseRound,
+};
+use std::collections::HashMap;
+use votes::{direct_vote_net, merge_vote_weight};
+
+pub struct DiscourseAudit {
+    pub round: usize,
+    pub moves: Vec<Move>,
+}
+
+/// #183: a claim that something is undefined / doesn't compile requires knowing the full symbol
+/// table (every field/variable/import declared anywhere in the file) to actually verify or
+/// refute — no lens has that, since every lens only ever sees `shared_context`'s diff, never
+/// full file contents (see `promptctx::shared_context`). A finding in this category clearing the
+/// vote threshold isn't evidence the claim is *true*; it only means no lens happened to
+/// construct a counter-argument, which for this claim category isn't the same thing (contrast a
+/// claim like "this method isn't called anywhere in the diff" — that a diff-only lens genuinely
+/// can verify or refute, and discourse routinely does correctly). Observed in practice: a
+/// discourse-AGREE'd P0 "undefined variable" claim that turned out to be wrong on inspection of
+/// the real source file, caught only incidentally (by evidence_unverified, because the LLM's
+/// evidence field happened to be a paraphrase rather than a verbatim diff quote) — a
+/// differently-worded version of the identical wrong claim would have sailed through as
+/// CONFIRMED. This treats the whole claim category as inherently unconfirmable from a diff
+/// alone, not dependent on how the evidence field happens to be phrased.
+fn claims_undefined_or_compile_error(claim: &str) -> bool {
+    let lower = claim.to_ascii_lowercase();
+    const MARKERS: [&str; 6] = [
+        "undefined variable",
+        "undefined reference",
+        "is not defined",
+        "isn't defined",
+        "compile error",
+        "compile-time error",
+    ];
+    MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// Iterates discourse rounds. Stops once there are no unresolved/UNCERTAIN findings left, or
+/// max_rounds is reached. Retries once per round if a round comes back with no CHALLENGE.
+///
+/// `outer_round` is the overall pipeline round carried across via `--prior` (the same number
+/// used by lens.rs::finding_id). If SURFACE ids were built from only the discourse-internal
+/// loop's `round` (which always restarts from 1), two different outer_round calls could
+/// coincidentally produce the same (round, index) pair, causing two completely different
+/// findings to share an id — the source of double-counted scores and overwritten discourse
+/// verdicts. We guard against this the same way lens.rs does, by folding outer_round into
+/// the id.
+pub fn run(
+    llm: &Llm,
+    spec: &Spec,
+    input: &Input,
+    findings: &mut Vec<Finding>,
+    max_rounds: usize,
+    outer_round: usize,
+) -> Result<(Vec<DiscourseAudit>, HashMap<String, Resolution>)> {
+    let max_rounds = max_rounds.max(1);
+    // #4 (LLM-accuracy operating points): was a hardcoded const — now spec-configurable via
+    // [discourse].vote_threshold, defaulting to the same 0.6.
+    let vote_threshold = spec.discourse.vote_threshold;
+    let mut resolved: HashMap<String, Resolution> = HashMap::new();
+    let mut audit: Vec<DiscourseAudit> = Vec::new();
+    // Discourse used to see only findings_catalog (the claim/evidence text left by reviewers)
+    // and never the raw diff at all — there was no way to actually cross-check and refute an
+    // absence claim like "not in the diff" (a false-positive case: it confirmed a cancel call
+    // was "missing" from dispose even though it was right there in the diff). Attaching ctx
+    // lets every round use the actual diff as evidence when making a verdict.
+    let ctx = shared_context(spec, input);
+
+    for round in 1..=max_rounds {
+        let unresolved = findings.iter().any(|f| {
+            resolved
+                .get(&f.id)
+                .map(|r| r.status == "UNCERTAIN")
+                .unwrap_or(true)
+        });
+        if !unresolved {
+            break;
+        }
+
+        let mut dr = run_round_call(llm, &ctx, spec, findings, &resolved, round)?;
+        for m in dr.moves.iter_mut() {
+            m.kind = normalize_move_kind(&m.kind);
+            m.confidence = normalize_confidence(&m.confidence);
+        }
+        if !dr.moves.iter().any(|m| m.kind == "CHALLENGE") {
+            dr = run_round_call(llm, &ctx, spec, findings, &resolved, round)
+                .context("retry request for missing CHALLENGE failed")?;
+            for m in dr.moves.iter_mut() {
+                m.kind = normalize_move_kind(&m.kind);
+                m.confidence = normalize_confidence(&m.confidence);
+            }
+        }
+
+        for (i, sf) in dr.surfaced.iter_mut().enumerate() {
+            sf.id = surface_id(outer_round, round, i + 1);
+            // The code always sets lens authoritatively — same principle as regular findings
+            // (lens.rs:221). Prevents any out-of-schema lens value the LLM sends from
+            // surviving as-is.
+            sf.lens = "discourse".to_string();
+            if sf.line.trim().is_empty() {
+                sf.line = "UNKNOWN".to_string();
+            }
+            sf.severity = crate::lens::normalize_severity(&sf.severity);
+        }
+        findings.extend(dr.surfaced.clone());
+
+        for m in dr.moves.iter_mut() {
+            if m.kind == "CHALLENGE" {
+                m.challenge_axis = normalize_challenge_axis(&m.challenge_axis);
+            }
+        }
+        // #148: pushed here (before resolutions are processed below), not at the end of the
+        // loop body — direct_vote_net/merge_vote_weight need to see this round's own moves to
+        // gate an LLM-authored CONFIRMED resolution against them.
+        audit.push(DiscourseAudit {
+            round,
+            moves: dr.moves,
+        });
+
+        // Real gap: MERGED and CONFIRMED resolutions used to be processed in whatever order the
+        // LLM emitted them in `dr.resolutions`. A CONFIRMED's vote net (below) calls
+        // merge_vote_weight, which reads `resolved` as it stands *at that point in the loop* —
+        // if this round's response listed `CONFIRM(Y)` before `MERGE(X → Y)`, X's merge hadn't
+        // been recorded into `resolved` yet, so its vote credit toward Y silently didn't count.
+        // A stable sort putting every MERGED resolution first (preserving relative order within
+        // each group) means a same-round merge is always visible to whatever depends on it,
+        // regardless of the order the LLM happened to state things in.
+        let mut resolutions = dr.resolutions.clone();
+        for r in resolutions.iter_mut() {
+            r.status = normalize_status(&r.status);
+        }
+        resolutions.sort_by_key(|r| r.status != "MERGED");
+        for mut r in resolutions {
+            // #140: mirrors fixcheck::verify_supersedes's treatment of superseded_by — a
+            // MERGED resolution naming a merged_into that isn't an actual finding id would
+            // otherwise vanish (excluded from `confirmed` as MERGED, but its vote weight never
+            // credited to anything real either, since the target it names doesn't exist).
+            // #154: merged_into == the finding's own id passed the "is this a real finding"
+            // check above trivially (a finding is always real relative to itself) — a
+            // self-merge silently sank the finding into MERGED with its vote weight credited
+            // nowhere, the same disappearing-act the check above exists to prevent.
+            let merges_into_self = r.status == "MERGED" && r.merged_into == r.finding_id;
+            if r.status == "MERGED"
+                && (merges_into_self || !findings.iter().any(|f| f.id == r.merged_into))
+            {
+                let problem = if merges_into_self {
+                    "merged_into is the finding's own id (self-merge)".to_string()
+                } else {
+                    format!(
+                        "merged_into(\"{}\") is not among this round's findings",
+                        r.merged_into
+                    )
+                };
+                r.reason = format!(
+                    "{} [Verification failed: {problem} — safely reverted to UNCERTAIN]",
+                    r.reason
+                );
+                r.status = "UNCERTAIN".to_string();
+            }
+            // #148: an LLM-authored CONFIRMED used to be trusted outright — inserted straight
+            // into `resolved` with no comparison against the local vote tally at all. The local
+            // confidence-weighted vote (direct_vote_net + merge_vote_weight) only ever ran as an
+            // end-of-rounds fallback for findings still UNCERTAIN after every round, which a
+            // directly-CONFIRMED finding never reaches. Requiring the vote net to actually clear
+            // the vote threshold — and the citation to have passed evidence::verify — makes local
+            // math a real check on the LLM's own resolution, not just a fallback for when it
+            // declines to state one.
+            if r.status == "CONFIRMED" {
+                let net = direct_vote_net(&audit, &r.finding_id)
+                    + merge_vote_weight(&resolved, &audit, &r.finding_id);
+                let (unverified, whole_file_claim) = findings
+                    .iter()
+                    .find(|f| f.id == r.finding_id)
+                    .map(|f| {
+                        (
+                            f.evidence_unverified,
+                            claims_undefined_or_compile_error(&f.claim),
+                        )
+                    })
+                    .unwrap_or((true, false));
+                if net < vote_threshold || unverified || whole_file_claim {
+                    r.reason = format!(
+                        "{} [Verification failed: local vote net={net:.2} (need >= {vote_threshold}) or evidence_unverified={unverified} or claim needs whole-file context no lens has={whole_file_claim} — reverted to UNCERTAIN instead of trusting the stated CONFIRMED]",
+                        r.reason
+                    );
+                    r.status = "UNCERTAIN".to_string();
+                } else {
+                    // Kept even on the passing path (not just the failure path above) so every
+                    // CONFIRMED resolution's net vote is recoverable from `state.json` alone --
+                    // needed to offline-resweep vote_threshold against past runs without
+                    // re-spending real LLM calls to regenerate them.
+                    r.reason = format!("{} [local vote net={net:.2}]", r.reason);
+                }
+            }
+            // #140: the prompt says resolutions "should only judge findings that are UNRESOLVED
+            // or were UNCERTAIN in the previous round," but nothing enforced that — a later
+            // round's LLM output re-judging an already-CONFIRMED/REJECTED id would silently
+            // replace it. Once a finding has a final verdict, keep it.
+            let already_final = matches!(
+                resolved.get(&r.finding_id).map(|e| e.status.as_str()),
+                Some("CONFIRMED") | Some("REJECTED")
+            );
+            if already_final {
+                continue;
+            }
+            resolved.insert(r.finding_id.clone(), r);
+        }
+
+        if round == max_rounds {
+            break;
+        }
+    }
+
+    // UNCERTAIN/unjudged findings left after rounds run out: instead of just discarding them,
+    // tally the AGREE/CHALLENGE votes across all rounds as a confidence-weighted vote for a
+    // final verdict.
+    for f in findings.iter() {
+        let still_uncertain = resolved
+            .get(&f.id)
+            .map(|r| r.status == "UNCERTAIN")
+            .unwrap_or(true);
+        if !still_uncertain {
+            continue;
+        }
+
+        // #140: was a hand-duplicated copy of votes::direct_vote_net's own logic (missing its
+        // new_evidence/dedup enforcement) — now calls it directly, so both fixes apply to the
+        // actual tally that decides CONFIRMED/REJECTED, not just to direct_vote_net's own
+        // internal use inside merge_vote_weight.
+        let net: f64 = direct_vote_net(&audit, &f.id) + merge_vote_weight(&resolved, &audit, &f.id);
+
+        // #148: same evidence_unverified gate applied to an LLM-authored CONFIRMED above — a
+        // finding whose citation didn't check out shouldn't get confirmed here either just
+        // because the vote net alone clears the threshold.
+        // #183: same for a claim needing whole-file context no lens has (see
+        // claims_undefined_or_compile_error's doc comment) — the vote net clearing threshold
+        // here just means no lens challenged it, not that it's actually true.
+        let whole_file_claim = claims_undefined_or_compile_error(&f.claim);
+        let (status, reason) = if net >= vote_threshold
+            && (f.evidence_unverified || whole_file_claim)
+        {
+            let why = match (f.evidence_unverified, whole_file_claim) {
+                (true, true) => {
+                    "evidence is unverified and the claim needs whole-file context no lens has"
+                }
+                (true, false) => "evidence is unverified",
+                (false, true) => "the claim needs whole-file context no lens has",
+                (false, false) => unreachable!("outer condition requires at least one to be true"),
+            };
+            (
+                "UNCERTAIN".to_string(),
+                format!(
+                    "discourse rounds exhausted, vote net={net:.2} clears the threshold but {why} — not confirmed"
+                ),
+            )
+        } else if net >= vote_threshold {
+            (
+                "CONFIRMED".to_string(),
+                format!("discourse rounds exhausted, confirmed by confidence-weighted vote (net={net:.2})"),
+            )
+        } else if net <= -vote_threshold {
+            (
+                "REJECTED".to_string(),
+                format!("discourse rounds exhausted, rejected by confidence-weighted vote (net={net:.2})"),
+            )
+        } else {
+            (
+                "UNCERTAIN".to_string(),
+                format!("discourse rounds exhausted, no verdict (net={net:.2})"),
+            )
+        };
+
+        resolved.insert(
+            f.id.clone(),
+            Resolution {
+                finding_id: f.id.clone(),
+                status,
+                merged_into: String::new(),
+                reason,
+            },
+        );
+    }
+
+    // #140: a severity-axis CHALLENGE deliberately never affects the confirm/reject vote (see
+    // #75) or `finding.severity` itself — auto-adjusting severity off an unvalidated LLM
+    // proposal risks silently downgrading a real P0 with nothing to catch it, worse than the
+    // status quo. But a CONFIRMED finding the panel also disputed the severity of currently has
+    // zero visibility next to the score-affecting entry itself (only the separate Discourse
+    // Audit table shows raw moves) — this makes that dispute visible right on the finding.
+    for f in findings.iter() {
+        let is_confirmed = resolved
+            .get(&f.id)
+            .map(|r| r.status == "CONFIRMED")
+            .unwrap_or(false);
+        if !is_confirmed {
+            continue;
+        }
+        let disputed = audit
+            .iter()
+            .flat_map(|a| a.moves.iter())
+            .any(|m| m.target == f.id && m.kind == "CHALLENGE" && m.challenge_axis == "SEVERITY");
+        if disputed {
+            if let Some(r) = resolved.get_mut(&f.id) {
+                r.reason =
+                    format!("{} [severity disputed by a discourse CHALLENGE — see Discourse Audit for detail]", r.reason);
+            }
+        }
+    }
+
+    Ok((audit, resolved))
+}
+
+fn run_round_call(
+    llm: &Llm,
+    ctx: &str,
+    spec: &Spec,
+    findings: &[Finding],
+    resolved: &HashMap<String, Resolution>,
+    round: usize,
+) -> Result<DiscourseRound> {
+    let task = build_round_prompt(spec, findings, resolved, round);
+    let dr: DiscourseRound = llm
+        .json_ctx_typed(Some(ctx), &task, Some(DISCOURSE_SYSTEM))
+        .with_context(|| format!("discourse round {round} failed"))?;
+    Ok(dr)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::test_finding;
+    use super::*;
+
+    #[test]
+    fn run_confirms_merge_survivor_even_with_zero_direct_votes() {
+        // Production scenario: two lenses (design, security) independently caught the same
+        // bug. discourse MERGEs the design side into the security side, but there isn't a
+        // single AGREE/CHALLENGE directly targeting the security side this round — before the
+        // fix, the security side stayed at UNCERTAIN with zero votes and never factored into
+        // the score at all.
+        let mut findings = vec![
+            test_finding("same bug from a design perspective too", "evidence A"),
+            test_finding("SQL injection from a security perspective", "evidence B"),
+        ];
+        findings[0].id = "design-r1-1".to_string();
+        findings[1].id = "security-r1-1".to_string();
+
+        let response = serde_json::json!({
+            "moves": [{"move": "CHALLENGE", "lens": "tests", "target": "design-r1-1", "detail": "d", "confidence": "high"}],
+            "resolutions": [{"finding_id": "design-r1-1", "status": "MERGED", "merged_into": "security-r1-1", "reason": "same root cause"}],
+            "surfaced": []
+        })
+        .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+        let input = Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+            config: crate::core::RunConfig::default(),
+        };
+
+        let (_audit, resolved) = run(
+            &llm,
+            &super::test_support::test_spec(),
+            &input,
+            &mut findings,
+            1,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(resolved["design-r1-1"].status, "MERGED");
+        assert_eq!(
+            resolved["security-r1-1"].status, "CONFIRMED",
+            "the MERGE target (survivor) must be confirmed even without direct votes"
+        );
+    }
+
+    #[test]
+    fn run_confirms_off_a_same_round_merge_even_when_the_confirm_is_listed_before_the_merge() {
+        // Real gap: unlike the fallback (end-of-rounds) confirmation path exercised by
+        // run_confirms_merge_survivor_even_with_zero_direct_votes above, an LLM-authored
+        // CONFIRMED is checked against the vote net *while this round's own resolutions array is
+        // still being processed* -- so it depends on `resolved` already reflecting any same-round
+        // MERGE the CONFIRMED needs credit from. This response lists "y"'s CONFIRMED *before*
+        // "x"'s MERGED-into-"y" -- with "y" having no direct votes of its own, its net only
+        // clears vote_threshold (0.6 default) if x's merge credit (confidence_weight("high") =
+        // 1.0) is visible when y's CONFIRMED is checked.
+        //
+        // max_rounds is 2 here (not 1) with only ONE fixture response queued -- this is what
+        // actually makes the bug observable end-to-end, not just as an internal status change:
+        // if y's CONFIRMED wrongly fails its vote-net check, y ends this round still UNCERTAIN,
+        // the top-of-loop `unresolved` check for round 2 sees that and fires a second LLM call --
+        // which the fixture queue doesn't have a response for, so `run()` would return Err
+        // instead of Ok. The end-of-rounds fallback (which recomputes correctly once every
+        // resolution is in) never gets a chance to run, because it only runs *after* the whole
+        // `for round in 1..=max_rounds` loop -- an unwanted round 2 already happened by then, and
+        // in a real (non-fixture) run that's a second real LLM call whose independent judgment
+        // could land anywhere, not a guaranteed do-over of round 1's correct answer.
+        let mut findings = vec![
+            test_finding("y-side claim", "evidence Y"),
+            test_finding("x-side claim, same bug", "evidence X"),
+        ];
+        findings[0].id = "y-r1-1".to_string();
+        findings[1].id = "x-r1-1".to_string();
+
+        let response = serde_json::json!({
+            "moves": [{"move": "CHALLENGE", "lens": "tests", "target": "nonexistent-target", "detail": "d", "confidence": "high", "challenge_axis": "existence"}],
+            "resolutions": [
+                {"finding_id": "y-r1-1", "status": "CONFIRMED", "merged_into": "", "reason": "confirmed"},
+                {"finding_id": "x-r1-1", "status": "MERGED", "merged_into": "y-r1-1", "reason": "same root cause"}
+            ],
+            "surfaced": []
+        })
+        .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+        let input = Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+            config: crate::core::RunConfig::default(),
+        };
+
+        let (_audit, resolved) = run(
+            &llm,
+            &super::test_support::test_spec(),
+            &input,
+            &mut findings,
+            2,
+            1,
+        )
+        .expect(
+            "round 1 alone must fully resolve y and x -- a wrongly-still-UNCERTAIN y would \
+             force an unwanted round 2, and the fixture queue has only one response",
+        );
+
+        assert_eq!(resolved["x-r1-1"].status, "MERGED");
+        assert_eq!(
+            resolved["y-r1-1"].status,
+            "CONFIRMED",
+            "y's CONFIRMED must stand on x's same-round merge credit regardless of which \
+             resolution was listed first: {:?}",
+            resolved.get("y-r1-1")
+        );
+    }
+
+    #[test]
+    fn run_honors_a_spec_configured_vote_threshold_stricter_than_the_default() {
+        // #4 (LLM-accuracy operating points): a single medium-confidence AGREE (weight 0.6)
+        // exactly clears the default 0.6 threshold -> CONFIRMED. A spec raising the threshold
+        // to 0.8 must leave the same vote net at UNCERTAIN instead — proving vote_threshold is
+        // actually read from the spec, not still the old hardcoded constant.
+        let mut findings = vec![test_finding("possible bug", "evidence")];
+        findings[0].id = "design-r1-1".to_string();
+
+        // Needs at least one CHALLENGE in the response or run() retries the round expecting one
+        // (see the loop body below) — a severity-axis CHALLENGE contributes 0 to direct_vote_net
+        // (only an EXISTENCE challenge subtracts), so it doesn't interfere with the net=0.6 this
+        // test is actually about.
+        let response = serde_json::json!({
+            "moves": [
+                {"move": "AGREE", "lens": "other", "target": "design-r1-1", "confidence": "medium", "new_evidence": "e"},
+                {"move": "CHALLENGE", "lens": "other2", "target": "design-r1-1", "confidence": "high", "challenge_axis": "severity", "detail": "severity may be overstated"}
+            ],
+            "resolutions": [],
+            "surfaced": []
+        })
+        .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+        let input = Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+            config: crate::core::RunConfig::default(),
+        };
+
+        let mut spec = super::test_support::test_spec();
+        spec.discourse.vote_threshold = 0.8;
+
+        let (_audit, resolved) = run(&llm, &spec, &input, &mut findings, 1, 1).unwrap();
+
+        assert_eq!(
+            resolved["design-r1-1"].status, "UNCERTAIN",
+            "net=0.6 must not confirm against a spec-raised threshold of 0.8"
+        );
+    }
+
+    #[test]
+    fn run_confirms_finding_despite_severity_only_challenge() {
+        // Production repro (#75): an SQL injection independently confirmed by 4 lenses got
+        // pushed to UNCERTAIN and vanished from the report because of a single CHALLENGE
+        // meaning "severity is overstated." Before the fix, this test's net would have been
+        // AGREE(1.0) + CHALLENGE(-1.0) = 0.0, i.e. UNCERTAIN.
+        let mut findings = vec![test_finding("SQL injection found", "evidence")];
+        findings[0].id = "security-r1-1".to_string();
+
+        let response = serde_json::json!({
+            "moves": [
+                {"move": "AGREE", "lens": "security", "target": "security-r1-1", "confidence": "high", "new_evidence": "e"},
+                {"move": "CHALLENGE", "lens": "style", "target": "security-r1-1", "confidence": "high", "challenge_axis": "severity", "detail": "severity is overstated"}
+            ],
+            "resolutions": [],
+            "surfaced": []
+        })
+        .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+        let input = Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+            config: crate::core::RunConfig::default(),
+        };
+
+        let (_audit, resolved) = run(
+            &llm,
+            &super::test_support::test_spec(),
+            &input,
+            &mut findings,
+            1,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved["security-r1-1"].status, "CONFIRMED",
+            "a severity-axis CHALLENGE must not subtract from the confirm vote"
+        );
+    }
+
+    #[test]
+    fn run_still_lets_existence_challenge_suppress_confirmation() {
+        // Regression guard: excluding the severity axis from the vote must not neutralize the
+        // existence axis too.
+        let mut findings = vec![test_finding("a claim that might be fake", "evidence")];
+        findings[0].id = "security-r1-1".to_string();
+
+        let response = serde_json::json!({
+            "moves": [
+                {"move": "AGREE", "lens": "security", "target": "security-r1-1", "confidence": "high", "new_evidence": "e"},
+                {"move": "CHALLENGE", "lens": "style", "target": "security-r1-1", "confidence": "high", "challenge_axis": "existence", "detail": "the evidence itself isn't in the diff"}
+            ],
+            "resolutions": [],
+            "surfaced": []
+        })
+        .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+        let input = Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+            config: crate::core::RunConfig::default(),
+        };
+
+        let (_audit, resolved) = run(
+            &llm,
+            &super::test_support::test_spec(),
+            &input,
+            &mut findings,
+            1,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved["security-r1-1"].status, "UNCERTAIN",
+            "an existence-axis CHALLENGE must still block confirmation (net=0)"
+        );
+    }
+
+    #[test]
+    fn run_reverts_an_llm_authored_confirmed_with_no_backing_vote() {
+        // #148 repro: before this fix, a directly-stated CONFIRMED resolution was inserted as-is
+        // with no comparison against the local vote tally at all — a CHALLENGE with no AGREE
+        // anywhere still ended up CONFIRMED just because the LLM's resolutions array said so.
+        let mut findings = vec![test_finding("a claim", "evidence")];
+        findings[0].id = "a".to_string();
+
+        let response = serde_json::json!({
+            "moves": [{
+                "move": "CHALLENGE", "lens": "tests", "target": "a",
+                "detail": "disputed", "confidence": "high", "challenge_axis": "existence"
+            }],
+            "resolutions": [{"finding_id": "a", "status": "CONFIRMED", "reason": "confirmed"}],
+            "surfaced": []
+        })
+        .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+        let input = Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+            config: crate::core::RunConfig::default(),
+        };
+
+        let (_audit, resolved) = run(
+            &llm,
+            &super::test_support::test_spec(),
+            &input,
+            &mut findings,
+            1,
+            1,
+        )
+        .unwrap();
+
+        assert_ne!(
+            resolved["a"].status, "CONFIRMED",
+            "an LLM-stated CONFIRMED with zero backing vote must not stand as-is"
+        );
+    }
+
+    #[test]
+    fn run_reverts_an_llm_authored_confirmed_whose_evidence_is_unverified() {
+        // #148: a finding with a genuine sufficient vote but a citation evidence::verify
+        // couldn't confirm must still not be trusted as CONFIRMED — the report's
+        // evidence_unverified marker used to have zero effect on scoring.
+        let mut findings = vec![test_finding("a claim", "evidence")];
+        findings[0].id = "a".to_string();
+        findings[0].evidence_unverified = true;
+
+        let response = serde_json::json!({
+            "moves": [
+                {
+                    "move": "CHALLENGE", "lens": "tests", "target": "nonexistent-target",
+                    "detail": "d", "confidence": "high", "challenge_axis": "existence"
+                },
+                {
+                    "move": "AGREE", "lens": "reviewer", "target": "a",
+                    "confidence": "high", "new_evidence": "e"
+                }
+            ],
+            "resolutions": [{"finding_id": "a", "status": "CONFIRMED", "reason": "confirmed"}],
+            "surfaced": []
+        })
+        .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+        let input = Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+            config: crate::core::RunConfig::default(),
+        };
+
+        let (_audit, resolved) = run(
+            &llm,
+            &super::test_support::test_spec(),
+            &input,
+            &mut findings,
+            1,
+            1,
+        )
+        .unwrap();
+
+        assert_ne!(
+            resolved["a"].status, "CONFIRMED",
+            "a CONFIRMED whose citation is evidence_unverified must not stand as-is even with a real vote"
+        );
+    }
+
+    // --- #183: claims_undefined_or_compile_error() / its gate ---
+
+    #[test]
+    fn claims_undefined_or_compile_error_matches_the_documented_phrasings() {
+        assert!(claims_undefined_or_compile_error(
+            "References an undefined variable `foo`, causing a compile-time error."
+        ));
+        assert!(claims_undefined_or_compile_error(
+            "This will not compile: undefined reference to `bar`."
+        ));
+        assert!(claims_undefined_or_compile_error(
+            "`baz` is not defined here."
+        ));
+    }
+
+    #[test]
+    fn claims_undefined_or_compile_error_does_not_match_an_ordinary_claim() {
+        assert!(!claims_undefined_or_compile_error(
+            "The removed method is still referenced elsewhere in this diff."
+        ));
+    }
+
+    #[test]
+    fn run_reverts_an_llm_authored_confirmed_whose_claim_needs_whole_file_context() {
+        // #183: a genuine vote and verified evidence, but the claim itself asserts something
+        // (undefined variable / compile error) that no diff-only lens can actually confirm or
+        // refute — must not stand as CONFIRMED even though neither the vote nor
+        // evidence_unverified alone would have blocked it.
+        let mut findings = vec![test_finding(
+            "References an undefined variable, a compile error.",
+            "evidence",
+        )];
+        findings[0].id = "a".to_string();
+        findings[0].evidence_unverified = false;
+
+        let response = serde_json::json!({
+            "moves": [
+                {
+                    "move": "CHALLENGE", "lens": "tests", "target": "nonexistent-target",
+                    "detail": "d", "confidence": "high", "challenge_axis": "existence"
+                },
+                {
+                    "move": "AGREE", "lens": "reviewer", "target": "a",
+                    "confidence": "high", "new_evidence": "e"
+                }
+            ],
+            "resolutions": [{"finding_id": "a", "status": "CONFIRMED", "reason": "confirmed"}],
+            "surfaced": []
+        })
+        .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+        let input = Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+            config: crate::core::RunConfig::default(),
+        };
+
+        let (_audit, resolved) = run(
+            &llm,
+            &super::test_support::test_spec(),
+            &input,
+            &mut findings,
+            1,
+            1,
+        )
+        .unwrap();
+
+        assert_ne!(
+            resolved["a"].status, "CONFIRMED",
+            "an undefined-variable/compile-error claim must not stand as CONFIRMED off a vote alone"
+        );
+    }
+
+    #[test]
+    fn run_confirms_when_both_the_vote_and_evidence_check_out() {
+        // Positive path: a real AGREE clears the vote threshold and evidence_unverified is false —
+        // the CONFIRMED must be allowed to stand.
+        let mut findings = vec![test_finding("a claim", "evidence")];
+        findings[0].id = "a".to_string();
+        findings[0].evidence_unverified = false;
+
+        let response = serde_json::json!({
+            "moves": [
+                {
+                    "move": "CHALLENGE", "lens": "tests", "target": "nonexistent-target",
+                    "detail": "d", "confidence": "high", "challenge_axis": "existence"
+                },
+                {
+                    "move": "AGREE", "lens": "reviewer", "target": "a",
+                    "confidence": "high", "new_evidence": "e"
+                }
+            ],
+            "resolutions": [{"finding_id": "a", "status": "CONFIRMED", "reason": "confirmed"}],
+            "surfaced": []
+        })
+        .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+        let input = Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+            config: crate::core::RunConfig::default(),
+        };
+
+        let (_audit, resolved) = run(
+            &llm,
+            &super::test_support::test_spec(),
+            &input,
+            &mut findings,
+            1,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved["a"].status, "CONFIRMED",
+            "a CONFIRMED backed by a real vote and verified evidence must stand"
+        );
+        assert!(
+            resolved["a"].reason.contains("[local vote net="),
+            "the passing net vote must be recoverable from reason for offline threshold resweeps, got: {}",
+            resolved["a"].reason
+        );
+    }
+
+    #[test]
+    fn run_does_not_launder_a_disputed_finding_via_merge() {
+        // #87 repro (at the run() level): design-r1-1 receives an existence-axis CHALLENGE and
+        // gets MERGED into security-r1-1. security-r1-1 itself has zero direct votes — before
+        // the fix, it would have gotten confirmed off merge_vote_weight's 1.0 alone.
+        let mut findings = vec![
+            test_finding("a suspicious SQL injection claim", "evidence A"),
+            test_finding("a weak security-related point", "evidence B"),
+        ];
+        findings[0].id = "design-r1-1".to_string();
+        findings[1].id = "security-r1-1".to_string();
+
+        let response = serde_json::json!({
+            "moves": [{
+                "move": "CHALLENGE", "lens": "tests", "target": "design-r1-1",
+                "detail": "the evidence itself isn't in the diff", "confidence": "high",
+                "challenge_axis": "existence"
+            }],
+            "resolutions": [{
+                "finding_id": "design-r1-1", "status": "MERGED",
+                "merged_into": "security-r1-1", "reason": "merged as the same issue"
+            }],
+            "surfaced": []
+        })
+        .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+        let input = Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+            config: crate::core::RunConfig::default(),
+        };
+
+        let (_audit, resolved) = run(
+            &llm,
+            &super::test_support::test_spec(),
+            &input,
+            &mut findings,
+            1,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(resolved["design-r1-1"].status, "MERGED");
+        assert_eq!(
+            resolved["security-r1-1"].status, "UNCERTAIN",
+            "the survivor must not be laundered into confirmation just because a disputed finding was merged into it"
+        );
+    }
+
+    #[test]
+    fn run_reverts_a_merged_resolution_whose_merged_into_does_not_name_a_real_finding() {
+        // #140: mirrors fixcheck::verify_supersedes's treatment of an invalid superseded_by —
+        // a hallucinated merged_into used to make the finding vanish (MERGED, excluded from
+        // `confirmed`, but its vote weight never credited to anything real either).
+        let mut findings = vec![test_finding("a claim", "evidence")];
+        findings[0].id = "a".to_string();
+
+        let response = serde_json::json!({
+            "moves": [{
+                "move": "CHALLENGE", "lens": "tests", "target": "nonexistent-target",
+                "detail": "d", "confidence": "high", "challenge_axis": "existence"
+            }],
+            "resolutions": [{
+                "finding_id": "a", "status": "MERGED",
+                "merged_into": "does-not-exist", "reason": "merged as same issue"
+            }],
+            "surfaced": []
+        })
+        .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+        let input = Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+            config: crate::core::RunConfig::default(),
+        };
+
+        let (_audit, resolved) = run(
+            &llm,
+            &super::test_support::test_spec(),
+            &input,
+            &mut findings,
+            1,
+            1,
+        )
+        .unwrap();
+
+        assert_ne!(
+            resolved["a"].status, "MERGED",
+            "a MERGED resolution naming a nonexistent merged_into must not stand as-is"
+        );
+    }
+
+    #[test]
+    fn run_reverts_a_merged_resolution_that_merges_a_finding_into_itself() {
+        // #154: merged_into == the finding's own id passes the "is this a real finding" check
+        // trivially — a self-merge used to silently sink the finding into MERGED status.
+        let mut findings = vec![test_finding("a claim", "evidence")];
+        findings[0].id = "a".to_string();
+
+        let response = serde_json::json!({
+            "moves": [{
+                "move": "CHALLENGE", "lens": "tests", "target": "nonexistent-target",
+                "detail": "d", "confidence": "high", "challenge_axis": "existence"
+            }],
+            "resolutions": [{
+                "finding_id": "a", "status": "MERGED",
+                "merged_into": "a", "reason": "merged into itself"
+            }],
+            "surfaced": []
+        })
+        .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+        let input = Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+            config: crate::core::RunConfig::default(),
+        };
+
+        let (_audit, resolved) = run(
+            &llm,
+            &super::test_support::test_spec(),
+            &input,
+            &mut findings,
+            1,
+            1,
+        )
+        .unwrap();
+
+        assert_ne!(
+            resolved["a"].status, "MERGED",
+            "a finding merged into itself must not stand as MERGED"
+        );
+    }
+
+    #[test]
+    fn run_does_not_let_a_later_round_overwrite_an_already_confirmed_finding() {
+        // #140: the prompt says resolutions should only judge UNRESOLVED/UNCERTAIN findings,
+        // but nothing enforced it — a later round re-judging an already-CONFIRMED id used to
+        // silently replace it.
+        let mut findings = vec![
+            test_finding("finding a", "evidence A"),
+            test_finding("finding b", "evidence B"),
+        ];
+        findings[0].id = "a".to_string();
+        findings[1].id = "b".to_string();
+
+        // Round 1: confirms "a" outright (backed by a real AGREE so #148's vote gate lets the
+        // CONFIRMED stand); "b" stays unresolved (nothing targets it), so the loop continues
+        // into round 2.
+        let round1 = serde_json::json!({
+            "moves": [
+                {
+                    "move": "CHALLENGE", "lens": "tests", "target": "nonexistent-target",
+                    "detail": "d", "confidence": "high", "challenge_axis": "existence"
+                },
+                {
+                    "move": "AGREE", "lens": "reviewer", "target": "a",
+                    "confidence": "high", "new_evidence": "confirmed independently"
+                }
+            ],
+            "resolutions": [{"finding_id": "a", "status": "CONFIRMED", "reason": "round1 confirm"}],
+            "surfaced": []
+        })
+        .to_string();
+        // Round 2: legitimately confirms "b" (backed by its own AGREE), but also tries to flip
+        // already-CONFIRMED "a" to REJECTED — that flip must not take effect.
+        let round2 = serde_json::json!({
+            "moves": [
+                {
+                    "move": "CHALLENGE", "lens": "tests", "target": "nonexistent-target-2",
+                    "detail": "d", "confidence": "high", "challenge_axis": "existence"
+                },
+                {
+                    "move": "AGREE", "lens": "reviewer", "target": "b",
+                    "confidence": "high", "new_evidence": "confirmed independently"
+                }
+            ],
+            "resolutions": [
+                {"finding_id": "a", "status": "REJECTED", "reason": "round2 tries to flip"},
+                {"finding_id": "b", "status": "CONFIRMED", "reason": "round2 confirm b"}
+            ],
+            "surfaced": []
+        })
+        .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![round1, round2], 0, usage);
+        let input = Input {
+            diff: "diff --git a/x b/x\n+++ b/x\n".to_string(),
+            changed_files: vec!["x".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+            config: crate::core::RunConfig::default(),
+        };
+
+        let (_audit, resolved) = run(
+            &llm,
+            &super::test_support::test_spec(),
+            &input,
+            &mut findings,
+            2,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved["a"].status, "CONFIRMED",
+            "an already-CONFIRMED finding must not be flipped by a later round"
+        );
+        assert!(
+            resolved["a"].reason.contains("round1 confirm"),
+            "the original round-1 resolution must survive, got: {}",
+            resolved["a"].reason
+        );
+        assert_eq!(resolved["b"].status, "CONFIRMED");
+    }
+
+    #[test]
+    fn run_notes_a_severity_dispute_on_a_confirmed_finding_without_changing_its_status() {
+        // #140: a severity-axis CHALLENGE deliberately never flips confirm/reject or touches
+        // finding.severity (see #75) — but it should be visible next to the finding itself,
+        // not only in the separate Discourse Audit table.
+        let mut findings = vec![test_finding("a claim", "evidence")];
+        findings[0].id = "a".to_string();
+        findings[0].severity = "P0".to_string();
+
+        let response = serde_json::json!({
+            "moves": [
+                {
+                    "move": "CHALLENGE", "lens": "tests", "target": "a",
+                    "detail": "severity is overstated", "confidence": "high", "challenge_axis": "severity"
+                },
+                // #148: a directly-stated CONFIRMED is now gated on the local vote net actually
+                // clearing the vote threshold — this AGREE is what makes that true here.
+                {
+                    "move": "AGREE", "lens": "reviewer", "target": "a",
+                    "confidence": "high", "new_evidence": "confirmed independently"
+                }
+            ],
+            "resolutions": [{"finding_id": "a", "status": "CONFIRMED", "reason": "confirmed"}],
+            "surfaced": []
+        })
+        .to_string();
+        let usage = Llm::new_usage_tracker();
+        let llm = Llm::fixture(vec![response], 0, usage);
+        let input = Input {
+            diff: "diff --git a/x.rs b/x.rs\n+++ b/x.rs\n@@ -1,1 +1,1 @@\n-old\n+new\n".to_string(),
+            changed_files: vec!["x.rs".to_string()],
+            added_lines: 1,
+            removed_lines: 0,
+            requirements: None,
+            conventions: None,
+            deterministic_results: None,
+            config: crate::core::RunConfig::default(),
+        };
+
+        let (_audit, resolved) = run(
+            &llm,
+            &super::test_support::test_spec(),
+            &input,
+            &mut findings,
+            1,
+            1,
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolved["a"].status, "CONFIRMED",
+            "a severity-axis challenge must not change confirm/reject"
+        );
+        assert!(
+            resolved["a"].reason.contains("severity disputed"),
+            "the severity dispute must be visible on the finding itself, got: {}",
+            resolved["a"].reason
+        );
+    }
+}
